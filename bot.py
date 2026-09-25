@@ -21,7 +21,6 @@ Render Web Service (Free): помимо бота поднимается крош
 import asyncio
 import logging
 import os
-import re
 import sys
 import time
 from pathlib import Path
@@ -44,6 +43,7 @@ from pyrogram.handlers import CallbackQueryHandler, MessageHandler
 from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from converter import ConvertError, convert_audio, ffmpeg_available, output_ext
+from database import get_and_increment_file_name, init_db
 
 # ============================== ДОСТУПЫ ==============================
 # В репозитории секретов нет вообще: значения читаются из окружения или из скрытых файлов
@@ -96,8 +96,9 @@ FORMATS = (
 )
 FORMAT_CODES = {code for code, _ in FORMATS}
 
-# Понятные имена файлов, которые увидит пользователь в полученном результате.
-# Вместо "video_2026-09-25_12-30-00.mp4" и случайных цифр — осмысленные фиксированные имена.
+# Запасные имена, если исходное имя файла неизвестно (или БД недоступна).
+# В обычном случае имя строится из оригинального имени + счётчика пользователя (database.py):
+# track.mp3 -> track_1.mp3 -> track_2.mp3...
 # ВАЖНО: file_name применяется только к отправке аудио/видео/документов; у голосовых
 # (send_voice / reply_voice) такого параметра нет — см. send_result().
 OUTPUT_NAMES = {
@@ -108,8 +109,8 @@ OUTPUT_NAMES = {
     "mp4": "video_output.mp4",
 }
 
-# Задачи держим в памяти процесса: file_id в callback_data не влезает (лимит 64 байта),
-# база данных для MVP не нужна. Ключ — id чата (= id пользователя в личке).
+# Задачи держим в памяти процесса: file_id в callback_data не влезает (лимит 64 байта), а сами
+# файлы в БД не храним — только счётчики (users_files). Ключ — id чата (= id пользователя в личке).
 PENDING: dict[int, dict] = {}
 
 # Клиента создаём внутри работающего event loop функцией create_app() — см. пояснение там.
@@ -145,13 +146,6 @@ def pick_media(message: Message):
     if document is not None and (document.mime_type or "").startswith(("audio/", "video/")):
         return document.file_name or "document.bin", document.file_size or 0
     return None
-
-
-def safe_stem(file_name: str) -> str:
-    """Безопасное имя без расширения: без слешей и path traversal."""
-    stem = Path(file_name).stem or "audio"
-    stem = re.sub(r"[^\w\-. ]+", "_", stem, flags=re.UNICODE).strip(" ._")
-    return stem[:60] or "audio"
 
 
 def human_size(num_bytes: int) -> str:
@@ -261,7 +255,7 @@ async def on_media(client: Client, message: Message) -> None:
         "message": message,  # сам Message нужен для потокового download()
         "chat_id": message.chat.id,
         "message_id": message.id,
-        "name": safe_stem(file_name),
+        "original_name": file_name,  # сырое имя (с расширением) — база для нумерации в БД
     }
     size_note = f" ({human_size(file_size)})" if file_size else ""
     await message.reply_text(
@@ -289,11 +283,13 @@ async def download_to_disk(client: Client, task: dict, input_path: Path, status:
     await fresh.download(file_name=str(input_path), progress=progress)
 
 
-async def send_result(task: dict, fmt: str, output_path: Path, file_name: str, progress) -> None:
+async def send_result(
+    task: dict, fmt: str, output_path: Path, file_name: str, title: str, progress
+) -> None:
     """Отправляет готовый файл в чат с понятным именем.
 
     Логика разделена по типам, потому что Telegram принимает file_name не везде:
-      * voice (OGG-голосовое) -> reply_voice БЕЗ file_name, иначе падает с
+      * voice (OGG-голосовое) -> reply_voice БЕЗ file_name/title, иначе падает с
         "TypeError: Message.reply_voice() got an unexpected keyword argument 'file_name'";
       * mp4 -> reply_video (file_name поддерживается);
       * mp3 / m4a / wav -> reply_audio (file_name и title поддерживаются).
@@ -310,7 +306,7 @@ async def send_result(task: dict, fmt: str, output_path: Path, file_name: str, p
     else:
         await message.reply_audio(
             audio=str(output_path),
-            title=Path(file_name).stem[:64],
+            title=title[:64],  # в плеере будет понятное название, а не "Неизвестен"
             file_name=file_name,
             progress=progress,
         )
@@ -339,7 +335,16 @@ async def on_format(client: Client, callback: CallbackQuery) -> None:
     # Уникальные имена => задачи разных пользователей не пересекаются.
     input_path = DOWNLOAD_DIR / f"{uuid4().hex}_in"
     output_path = DOWNLOAD_DIR / f"{uuid4().hex}_out.{ext}"
-    result_name = output_filename(fmt)  # понятное имя: converted_audio.mp3 и т.п.
+    # Имя и Title по счётчику из БД: 1-й файл -> track.mp3, 2-й -> track_1.mp3, ...
+    # Берём исходное имя (или дружелюбный fallback по формату) и расширение выбранного формата.
+    source_name = task.get("original_name") or Path(output_filename(fmt)).name
+    try:
+        result_name, result_title = await get_and_increment_file_name(
+            callback.from_user.id, source_name, ext
+        )
+    except Exception as exc:  # подстраховка: БД ни при каких условиях не роняет конвертацию
+        print(f"⚠️ Ошибка нумерации ({type(exc).__name__}: {exc}) — имя по умолчанию")
+        result_name, result_title = output_filename(fmt), Path(output_filename(fmt)).stem
 
     try:
         try:
@@ -370,8 +375,8 @@ async def on_format(client: Client, callback: CallbackQuery) -> None:
         else:
             action = enums.ChatAction.UPLOAD_DOCUMENT
         await chat_action(client, chat_id, action)
-        # Раздельная отправка: voice -> без file_name, audio/video -> с понятным file_name.
-        await send_result(task, fmt, output_path, result_name, upload_progress)
+        # Раздельная отправка: voice -> без file_name, audio/video -> с именем из БД и Title.
+        await send_result(task, fmt, output_path, result_name, result_title, upload_progress)
 
         try:
             await status.delete()
@@ -523,6 +528,10 @@ async def main() -> None:
     for stale in DOWNLOAD_DIR.iterdir():  # подчищаем хвосты прошлых запусков
         if stale.is_file():
             stale.unlink(missing_ok=True)
+
+    # Создаём/открываем SQLite (bot_database.db) при старте: таблица users_files
+    # появится автоматически. Ошибка БД не мешает запуску бота (см. database.py).
+    await init_db()
 
     app = create_app()
     await asyncio.sleep(0.05)  # даём форку фактически зарегистрировать хендлеры

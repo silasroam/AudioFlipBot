@@ -13,5 +13,11 @@ __pycache__/
 *.pyc
 *.log
 
+# локальная база SQLite (создаётся автоматически)
+bot_database.db
+bot_database.db-journal
+bot_database.db-wal
+bot_database.db-shm
+
 # локальное окружение
 .venv/
