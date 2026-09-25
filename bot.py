@@ -1,0 +1,522 @@
+"""Telegram-бот-конвертер на Pyrogram (MTProto): принимает файлы до 2000 МБ.
+
+Почему Pyrogram, а не aiogram: Bot API не отдаёт боту файлы больше 20 МБ и не принимает
+результаты больше 50 МБ. MTProto (клиентский API, под которым работает Pyrogram) этих
+ограничений не имеет — лимит 2000 МБ.
+Скачивание идёт chunk-by-chunk сразу на диск (Pyrogram пишет каждый полученный чанк в
+открытый файл), поэтому оперативная память остаётся низкой — это важно для Render 512 МБ.
+
+Запуск:
+    pip install -r requirements.txt
+    # секреты берутся из окружения или из скрытых файлов рядом с bot.py:
+    #   .api_id, .api_hash, .bot_token  (они в .gitignore)
+    # на сервере удобнее переменные окружения: API_ID, API_HASH, BOT_TOKEN
+    python bot.py
+
+Render Web Service (Free): помимо бота поднимается крошечный aiohttp-сервер на
+0.0.0.0:$PORT (по умолчанию 10000) с маршрутами / и /health -> 200 OK — Render
+сканирует открытые порты и без них убивает сервис с "No open ports detected".
+"""
+
+import asyncio
+import logging
+import os
+import re
+import sys
+import time
+from pathlib import Path
+from uuid import uuid4
+
+from aiohttp import web
+from pyrogram import Client, enums, filters, idle
+from pyrogram.errors import (
+    AuthKeyDuplicated,
+    AuthKeyInvalid,
+    AuthKeyUnregistered,
+    FileReferenceExpired,
+    FileReferenceInvalid,
+    FloodWait,
+    MessageNotModified,
+    RPCError,
+    SessionRevoked,
+)
+from pyrogram.handlers import CallbackQueryHandler, MessageHandler
+from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+
+from converter import ConvertError, convert_audio, ffmpeg_available, output_ext
+
+# ============================== ДОСТУПЫ ==============================
+# В репозитории секретов нет вообще: значения читаются из окружения или из скрытых файлов
+# рядом с bot.py (.api_id / .api_hash / .bot_token — они перечислены в .gitignore).
+BASE_DIR = Path(__file__).resolve().parent
+DOWNLOAD_DIR = BASE_DIR / "downloads"
+DOWNLOAD_DIR.mkdir(exist_ok=True)
+
+HIDDEN_FILES = {"API_ID": ".api_id", "API_HASH": ".api_hash", "BOT_TOKEN": ".bot_token"}
+
+
+def credential(name: str) -> str:
+    """Секрет из переменной окружения, иначе из скрытого файла, иначе пустая строка.
+
+    Локально: положи значения в файлы .api_id, .api_hash, .bot_token (по одному значению).
+    На Render: задай API_ID, API_HASH, BOT_TOKEN в Environment Variables — кода менять не надо.
+    """
+    env_value = os.getenv(name, "").strip()
+    if env_value:
+        return env_value
+
+    hidden = BASE_DIR / HIDDEN_FILES[name]
+    if hidden.exists():
+        return hidden.read_text(encoding="utf-8").strip()
+
+    return ""
+
+
+API_ID_TEXT = credential("API_ID")
+API_ID = int(API_ID_TEXT) if API_ID_TEXT.isdigit() else 0
+API_HASH = credential("API_HASH")
+BOT_TOKEN = credential("BOT_TOKEN")
+
+# ============================== НАСТРОЙКИ ==============================
+SESSION_NAME = "audio_converter_bot"  # имя файла сессии: <SESSION_NAME>.session
+MAX_FILE_SIZE = 2000 * 1024 * 1024  # предел MTProto: больше — не скачаем, проверяем заранее
+PROGRESS_STEP = 5.0  # как часто обновлять текст прогресса (секунды)
+
+# --- Мини-HTTP-сервер для Render Web Service (Free) ---
+# Render сканирует открытые порты и без них рушит сервис с "No open ports detected".
+# Слушаем 0.0.0.0:$PORT (Render сам подставляет PORT; 10000 — дефолт для локального запуска).
+HEALTH_HOST = "0.0.0.0"
+DEFAULT_PORT = 10000
+
+FORMATS = (
+    ("mp3", "🎵 MP3"),
+    ("voice", "🗣 OGG (голосовое)"),
+    ("wav", "🔊 WAV"),
+    ("m4a", "📱 M4A"),
+)
+FORMAT_CODES = {code for code, _ in FORMATS}
+
+# Задачи держим в памяти процесса: file_id в callback_data не влезает (лимит 64 байта),
+# база данных для MVP не нужна. Ключ — id чата (= id пользователя в личке).
+PENDING: dict[int, dict] = {}
+
+# Клиента создаём внутри работающего event loop функцией create_app() — см. пояснение там.
+
+
+# ============================== ВСПОМОГАТЕЛЬНОЕ ==============================
+
+
+def format_keyboard() -> InlineKeyboardMarkup:
+    """Инлайн-кнопки выбора формата (по 2 в ряд)."""
+    buttons = [
+        InlineKeyboardButton(text=title, callback_data=f"fmt:{code}")
+        for code, title in FORMATS
+    ]
+    return InlineKeyboardMarkup([buttons[i:i + 2] for i in range(0, len(buttons), 2)])
+
+
+def pick_media(message: Message):
+    """(имя_файла, размер_в_байтах) для поддерживаемого медиа или None."""
+    for attr, fallback_ext in (
+        ("audio", "mp3"),
+        ("voice", "oga"),
+        ("video_note", "mp4"),
+        ("video", "mp4"),
+        ("animation", "mp4"),
+    ):
+        media = getattr(message, attr, None)
+        if media is not None:
+            name = getattr(media, "file_name", None) or f"{attr}.{fallback_ext}"
+            return name, getattr(media, "file_size", 0) or 0
+
+    document = getattr(message, "document", None)
+    if document is not None and (document.mime_type or "").startswith(("audio/", "video/")):
+        return document.file_name or "document.bin", document.file_size or 0
+    return None
+
+
+def safe_stem(file_name: str) -> str:
+    """Безопасное имя без расширения: без слешей и path traversal."""
+    stem = Path(file_name).stem or "audio"
+    stem = re.sub(r"[^\w\-. ]+", "_", stem, flags=re.UNICODE).strip(" ._")
+    return stem[:60] or "audio"
+
+
+def human_size(num_bytes: int) -> str:
+    """Байты в удобочитаемый вид: 1.5 ГБ, 240.3 МБ и т.п."""
+    size = float(num_bytes or 0)
+    for unit in ("Б", "КБ", "МБ", "ГБ"):
+        if size < 1024:
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} ТБ"
+
+
+async def safe_edit(status: Message, text: str) -> None:
+    """Правит текст статуса, глотая 'message is not modified' и флуд-лимиты."""
+    try:
+        await status.edit_text(text)
+    except MessageNotModified:
+        pass
+    except FloodWait as exc:
+        await asyncio.sleep(exc.value)
+    except RPCError:
+        pass
+
+
+def make_progress(status: Message, label: str):
+    """Фабрика колбэка прогресса: Pyrogram зовёт его как progress(current, total, *args)."""
+    state = {"start": time.monotonic(), "last": 0.0}
+
+    async def progress(current: int, total: int) -> None:
+        now = time.monotonic()
+        if total and current < total and now - state["last"] < PROGRESS_STEP:
+            return
+        state["last"] = now
+
+        total = total or current
+        percent = current * 100 / total if total else 100.0
+        elapsed = max(now - state["start"], 0.001)
+        speed = current / elapsed
+        left = int((total - current) / speed) if speed > 0 else 0
+
+        await safe_edit(
+            status,
+            f"{label} {percent:.1f}%\n"
+            f"{human_size(current)} из {human_size(total)} · {human_size(int(speed))}/с · "
+            f"осталось ~{left} с",
+        )
+
+    return progress
+
+
+async def chat_action(client: Client, chat_id: int, action) -> None:
+    """Показывает «печатает/отправляет»; часть действий ботам недоступна — не падаем."""
+    try:
+        await client.send_chat_action(chat_id, action)
+    except (RPCError, AttributeError):
+        pass
+
+
+# ============================== ХЕНДЛЕРЫ ==============================
+# Хендлеры регистрируются вручную в create_app(): порядок важен, а декораторы в этом
+# форке работают только при создании клиента уже внутри работающего event loop.
+
+
+async def on_start(client: Client, message: Message) -> None:
+    await message.reply_text(
+        "👋 Пришли мне аудио, голосовое сообщение, видеосообщение, видео или файл — "
+        "предложу форматы: MP3, OGG (голосовое), WAV, M4A.\n"
+        "Работаю через MTProto, поэтому принимаю файлы до 2000 МБ."
+    )
+
+
+MEDIA_FILTER = filters.incoming & (
+    filters.audio
+    | filters.voice
+    | filters.video
+    | filters.video_note
+    | filters.document
+    | filters.animation
+)
+
+
+async def on_media(client: Client, message: Message) -> None:
+    """Приём медиа: кладём задачу в память и показываем кнопки форматов."""
+    picked = pick_media(message)
+    if picked is None:
+        await message.reply_text("❌ Это не аудио и не видео. Пришли звуковой или видеофайл.")
+        return
+
+    file_name, file_size = picked
+    if file_size and file_size > MAX_FILE_SIZE:
+        await message.reply_text(
+            f"❌ Файл {human_size(file_size)} больше предела MTProto "
+            f"({human_size(MAX_FILE_SIZE)}) — такой бот скачать не сможет."
+        )
+        return
+
+    PENDING[message.chat.id] = {
+        "message": message,  # сам Message нужен для потокового download()
+        "chat_id": message.chat.id,
+        "message_id": message.id,
+        "name": safe_stem(file_name),
+    }
+    size_note = f" ({human_size(file_size)})" if file_size else ""
+    await message.reply_text(
+        f"📥 Файл получен{size_note}. Выбери целевой формат:",
+        reply_markup=format_keyboard(),
+    )
+
+
+async def download_to_disk(client: Client, task: dict, input_path: Path, status: Message) -> None:
+    """Качает файл кусками прямо в input_path, без буферизации в оперативке.
+
+    Если file_reference успел протухнуть — перезапрашиваем сообщение и качаем снова.
+    """
+    progress = make_progress(status, "⏳ Скачиваю")
+    try:
+        await task["message"].download(file_name=str(input_path), progress=progress)
+        return
+    except (FileReferenceExpired, FileReferenceInvalid):
+        pass
+
+    fresh = await client.get_messages(task["chat_id"], task["message_id"])
+    if fresh is None:
+        raise ConvertError("сообщение больше недоступно, пришли файл заново")
+    task["message"] = fresh
+    await fresh.download(file_name=str(input_path), progress=progress)
+
+
+async def on_format(client: Client, callback: CallbackQuery) -> None:
+    """Скачать -> сконвертировать -> отправить -> удалить временные файлы."""
+    data = callback.data or ""
+    if not data.startswith("fmt:"):
+        await callback.answer("Неизвестная кнопка")
+        return
+
+    fmt = data.split(":", 1)[1]
+    task = PENDING.pop(callback.from_user.id, None) if callback.from_user else None
+    if task is None or fmt not in FORMAT_CODES:
+        await callback.answer("Кнопка устарела, пришли файл заново", show_alert=True)
+        return
+    if callback.message is None:
+        await callback.answer("Сообщение недоступно, пришли файл заново", show_alert=True)
+        return
+    await callback.answer()
+
+    status = callback.message  # статус показываем прямо в сообщении с кнопками
+    chat_id = task["chat_id"]
+    ext = output_ext(fmt)
+    # Уникальные имена => задачи разных пользователей не пересекаются.
+    input_path = DOWNLOAD_DIR / f"{uuid4().hex}_in"
+    output_path = DOWNLOAD_DIR / f"{uuid4().hex}_out.{ext}"
+    result_name = f"{task['name']}.{ext}"
+
+    try:
+        try:
+            await status.edit_reply_markup(None)  # убираем кнопки, чтобы не жали дважды
+        except RPCError:
+            pass
+
+        await safe_edit(status, "⏳ Скачиваю файл из Telegram...")
+        await chat_action(client, chat_id, enums.ChatAction.TYPING)
+        await download_to_disk(client, task, input_path, status)
+
+        size_in = input_path.stat().st_size if input_path.exists() else 0
+        await safe_edit(
+            status,
+            f"🔄 Конвертирую в {ext.upper()} через ffmpeg...\n"
+            f"Вход: {human_size(size_in)}. Большие файлы кодируются долго — не выключай бота.",
+        )
+        await chat_action(client, chat_id, enums.ChatAction.TYPING)
+        await convert_audio(input_path, output_path, fmt)
+
+        size_out = output_path.stat().st_size
+        await safe_edit(status, f"📤 Отправляю результат ({human_size(size_out)})...")
+        upload_progress = make_progress(status, "📤 Отправляю")
+        if fmt == "voice":
+            await chat_action(client, chat_id, enums.ChatAction.UPLOAD_AUDIO)
+            await task["message"].reply_voice(
+                voice=str(output_path), file_name=result_name, progress=upload_progress
+            )
+        else:
+            await chat_action(client, chat_id, enums.ChatAction.UPLOAD_DOCUMENT)
+            await task["message"].reply_audio(
+                audio=str(output_path),
+                title=task["name"][:64],
+                file_name=result_name,
+                progress=upload_progress,
+            )
+
+        try:
+            await status.delete()
+        except RPCError:
+            pass
+
+    except ConvertError as exc:
+        await safe_edit(status, f"❌ Не удалось сконвертировать: {str(exc)[:300]}")
+    except ValueError as exc:
+        # например "Can't upload files bigger than 2000 MiB"
+        await safe_edit(status, f"❌ Файл слишком большой для отправки: {str(exc)[:200]}")
+    except FloodWait as exc:
+        await safe_edit(status, f"⏳ Telegram просит подождать {exc.value} с — нажми кнопку ещё раз.")
+    except RPCError as exc:
+        await safe_edit(status, f"❌ Ошибка Telegram: {str(exc)[:200]}")
+    except Exception as exc:  # сеть, диск, лимиты — бот не должен падать
+        await safe_edit(status, f"❌ Ошибка: {str(exc)[:200]}")
+    finally:
+        # КРИТИЧНО: временные файлы удаляем при любом исходе, чтобы не забить диск.
+        for path in (input_path, output_path):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+async def on_other(client: Client, message: Message) -> None:
+    """Всё, что не медиа и не команда: короткая подсказка."""
+    try:
+        await message.reply_text("Пришли аудио, голосовое сообщение, видео или файл 🙂")
+    except RPCError:
+        pass
+
+
+# ============================== HTTP-СЕРВЕР ДЛЯ RENDER ==============================
+# Render Web Service (Free) обязан видеть открытый порт, иначе процесс убивается
+# с ошибкой "No open ports detected". Боту HTTP не нужен — это просто "заглушка",
+# которая отвечает 200 OK на / и /health. На конвертацию, PENDING и ffmpeg не влияет.
+
+
+def health_port() -> int:
+    """Порт из $PORT (Render), иначе 10000. Некорректное значение — откат к дефолту."""
+    raw = os.getenv("PORT", "").strip()
+    try:
+        port = int(raw)
+    except ValueError:
+        if raw:
+            print(f"⚠️ PORT={raw!r} — не число, использую {DEFAULT_PORT}")
+        return DEFAULT_PORT
+    return port if 0 < port < 65536 else DEFAULT_PORT
+
+
+async def start_health_server() -> web.AppRunner:
+    """Поднимает aiohttp-сервер на 0.0.0.0:$PORT с маршрутами / и /health.
+
+    Возвращает AppRunner — его нужно закрыть (runner.cleanup()) при остановке,
+    чтобы освободить порт. Запускать до старта Pyrogram-клиента.
+    """
+    async def health(_request: web.Request) -> web.Response:
+        return web.Response(text="OK", status=200)
+
+    health_app = web.Application()
+    health_app.router.add_get("/", health)
+    health_app.router.add_get("/health", health)
+
+    runner = web.AppRunner(health_app)
+    await runner.setup()
+    port = health_port()
+    site = web.TCPSite(runner, host=HEALTH_HOST, port=port)
+    await site.start()
+    print(f"🌐 Health-сервер слушает http://{HEALTH_HOST}:{port} (/, /health -> 200 OK)")
+    return runner
+
+
+# ============================== ЗАПУСК ==============================
+
+
+def create_app() -> Client:
+    """Создаёт клиента и регистрирует хендлеры. ВЫЗЫВАТЬ ТОЛЬКО внутри работающего event loop.
+
+    Почему так: форк регистрирует хендлеры асинхронно (`client.loop.create_task`), а
+    `Client.loop` — ленивое свойство, кеширующее первый полученный loop. Если создать
+    клиента на импорте модуля (до старта loop), он привяжется к неработающему loop:
+    хендлеры не подключатся, а сессии упадут с "attached to a different loop".
+    Регистрация явная: первый подходящий хендлер в группе выигрывает, поэтому order важен.
+    """
+    client = Client(
+        name=SESSION_NAME,
+        api_id=API_ID,
+        api_hash=API_HASH,
+        bot_token=BOT_TOKEN,
+        workdir=str(BASE_DIR),
+    )
+    client.add_handler(MessageHandler(on_start, filters.incoming & filters.command("start")))
+    client.add_handler(MessageHandler(on_media, MEDIA_FILTER))
+    client.add_handler(MessageHandler(on_other, filters.incoming))
+    client.add_handler(CallbackQueryHandler(on_format))
+    return client
+
+
+SESSION_ERRORS = (SessionRevoked, AuthKeyUnregistered, AuthKeyDuplicated, AuthKeyInvalid)
+
+
+async def start_client(client: Client) -> Client:
+    """Стартует клиента, а если сессия мертва — пересоздаёт её автоматически.
+
+    Сценарий: токен бота сменили у @BotFather (/revoke) — Telegram инвалидирует все сессии,
+    и сохранённый <SESSION_NAME>.session перестаёт пускать (401 SESSION_REVOKED), даже если
+    в коде уже новый токен. В этом случае файлы сессии удаляются, и бот логинится заново
+    по BOT_TOKEN: руками чистить ничего не нужно.
+    """
+    try:
+        await client.start()
+        return client
+    except SESSION_ERRORS as exc:
+        print(f"⚠️ Сессия недействительна ({type(exc).__name__}) — удаляю её и логинюсь заново")
+
+    try:
+        await client.stop()
+    except Exception:
+        pass
+
+    for session_file in BASE_DIR.glob(f"{SESSION_NAME}.session*"):
+        try:
+            session_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    fresh = create_app()
+    await fresh.start()
+    print("✅ Переавторизация по BOT_TOKEN прошла")
+    return fresh
+
+
+async def main() -> None:
+    missing = [
+        name
+        for name, value in (("API_ID", API_ID), ("API_HASH", API_HASH), ("BOT_TOKEN", BOT_TOKEN))
+        if not value
+    ]
+    if missing:
+        sys.exit(
+            "Не заданы: " + ", ".join(missing) + ". Задай их переменными окружения "
+            "или файлами .api_id / .api_hash / .bot_token рядом с bot.py"
+        )
+    if not ffmpeg_available():
+        sys.exit("ffmpeg не найден. Установи: sudo apt install ffmpeg | brew install ffmpeg")
+
+    for stale in DOWNLOAD_DIR.iterdir():  # подчищаем хвосты прошлых запусков
+        if stale.is_file():
+            stale.unlink(missing_ok=True)
+
+    app = create_app()
+    await asyncio.sleep(0.05)  # даём форку фактически зарегистрировать хендлеры
+    registered = {
+        group: [handler.callback.__name__ for handler in handlers]
+        for group, handlers in app.dispatcher.groups.items()
+    }
+    if not registered:
+        sys.exit("Хендлеры не зарегистрировались: Client создан вне работающего event loop")
+    print(f"🔧 Хендлеры: {registered}")
+
+    # Render Web Service (Free) должен видеть открытый порт — поднимаем HTTP-заглушку
+    # до старта Pyrogram-клиента. Падение веб-сервера не должно ронять бота.
+    health_runner: web.AppRunner | None = None
+    try:
+        health_runner = await start_health_server()
+    except OSError as exc:  # порт занят или недоступен
+        print(f"⚠️ Health-сервер не поднялся ({exc}) — продолжаю без него")
+
+    app = await start_client(app)  # при мёртвой сессии вернёт переавторизованного клиента
+    me = await app.get_me()
+    print(
+        f"✅ Бот @{me.username} запущен через Pyrogram/MTProto. "
+        f"Лимит файла: {human_size(MAX_FILE_SIZE)}. Остановить: Ctrl+C"
+    )
+    try:
+        await idle()  # держим процесс живым и слушаем апдейты
+    finally:
+        await app.stop()
+        if health_runner is not None:
+            await health_runner.cleanup()  # освобождаем порт при остановке
+        print("⛔ Остановлено")
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+    logging.getLogger("pyrogram").setLevel(logging.WARNING)  # прячем INFO-шум клиента
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n⛔ Остановлено (Ctrl+C)")

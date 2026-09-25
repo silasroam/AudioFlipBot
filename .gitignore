@@ -1,0 +1,17 @@
+# секреты
+.bot_token
+.api_id
+.api_hash
+.env
+.env.*
+*.session
+*.session-journal
+
+# временные файлы и кеш
+downloads/
+__pycache__/
+*.pyc
+*.log
+
+# локальное окружение
+.venv/
