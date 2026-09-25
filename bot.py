@@ -40,7 +40,14 @@ from pyrogram.errors import (
     SessionRevoked,
 )
 from pyrogram.handlers import CallbackQueryHandler, MessageHandler
-from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from pyrogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+)
 
 from converter import ConvertError, convert_audio, ffmpeg_available, output_ext
 from database import get_and_increment_file_name, init_db
@@ -169,6 +176,19 @@ def format_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([buttons[i:i + 2] for i in range(0, len(buttons), 2)])
 
 
+def start_keyboard() -> ReplyKeyboardMarkup:
+    """Закреплённая нижняя кнопка «Старт» — всегда видна под полем ввода.
+
+    is_persistent=True — Telegram держит клавиатуру внизу постоянно (не сворачивается);
+    resize_keyboard=True — компактная кнопка, а не на всю высоту экрана.
+    """
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton(UI.BUTTON_START)]],
+        is_persistent=True,
+        resize_keyboard=True,
+    )
+
+
 def pick_media(message: Message):
     """(имя_файла, размер_в_байтах, тип_медиа) для поддерживаемого медиа или None.
 
@@ -271,7 +291,7 @@ async def chat_action(client: Client, chat_id: int, action) -> None:
 
 
 async def on_start(client: Client, message: Message) -> None:
-    """Приветствие: логотип Logostart.png с подписью. Нет картинки — просто текст."""
+    """Приветствие: логотип Logostart.png с подписью + закреплённая кнопка «Старт»."""
     logo = find_logo()
     if logo is not None:
         try:
@@ -279,12 +299,30 @@ async def on_start(client: Client, message: Message) -> None:
                 photo=str(logo),
                 caption=UI.START,
                 parse_mode=enums.ParseMode.MARKDOWN,
+                reply_markup=start_keyboard(),
             )
             return
         except RPCError as exc:
             print(LOGO_ERR_SEND.format(error=f"{type(exc).__name__}: {exc}"))
 
-    await message.reply_text(UI.START, parse_mode=enums.ParseMode.MARKDOWN)
+    await message.reply_text(
+        UI.START,
+        parse_mode=enums.ParseMode.MARKDOWN,
+        reply_markup=start_keyboard(),
+    )
+
+
+# В этом форке Pyrogram `filters.text` — это «любой текст» (без аргумента), поэтому точное
+# совпадение с подписью нижней кнопки делаем своим фильтром через filters.create.
+START_BUTTON_FILTER = filters.create(
+    lambda _, __, message: (message.text or "") == UI.BUTTON_START,
+    name="StartButton",
+)
+
+
+async def on_start_button(client: Client, message: Message) -> None:
+    """Нажатие закреплённой кнопки «Старт» внизу — то же приветствие, что и по /start."""
+    await on_start(client, message)
 
 
 MEDIA_FILTER = filters.incoming & (
@@ -301,12 +339,14 @@ async def on_media(client: Client, message: Message) -> None:
     """Приём медиа: кладём задачу в память и показываем кнопки форматов."""
     picked = pick_media(message)
     if picked is None:
-        await message.reply_text(UI.NOT_MEDIA)
+        await message.reply_text(UI.NOT_MEDIA, reply_markup=start_keyboard())
         return
 
     file_name, file_size, media_kind = picked
     if file_size and file_size > MAX_FILE_SIZE:
-        await message.reply_text(UI.file_too_large(human_size(file_size)))
+        await message.reply_text(
+            UI.file_too_large(human_size(file_size)), reply_markup=start_keyboard()
+        )
         return
 
     PENDING[message.chat.id] = {
@@ -472,7 +512,7 @@ async def on_format(client: Client, callback: CallbackQuery) -> None:
 async def on_other(client: Client, message: Message) -> None:
     """Всё, что не медиа и не команда: короткая подсказка."""
     try:
-        await message.reply_text(UI.OTHER)
+        await message.reply_text(UI.OTHER, reply_markup=start_keyboard())
     except RPCError:
         pass
 
@@ -537,6 +577,9 @@ def create_app() -> Client:
         workdir=str(BASE_DIR),
     )
     client.add_handler(MessageHandler(on_start, filters.incoming & filters.command("start")))
+    client.add_handler(
+        MessageHandler(on_start_button, filters.incoming & START_BUTTON_FILTER)
+    )
     client.add_handler(MessageHandler(on_media, MEDIA_FILTER))
     client.add_handler(MessageHandler(on_other, filters.incoming))
     client.add_handler(CallbackQueryHandler(on_format))
