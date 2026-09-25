@@ -96,6 +96,18 @@ FORMATS = (
 )
 FORMAT_CODES = {code for code, _ in FORMATS}
 
+# Понятные имена файлов, которые увидит пользователь в полученном результате.
+# Вместо "video_2026-09-25_12-30-00.mp4" и случайных цифр — осмысленные фиксированные имена.
+# ВАЖНО: file_name применяется только к отправке аудио/видео/документов; у голосовых
+# (send_voice / reply_voice) такого параметра нет — см. send_result().
+OUTPUT_NAMES = {
+    "mp3": "converted_audio.mp3",
+    "m4a": "audio_track.m4a",
+    "wav": "audio_track.wav",
+    "voice": "voice_message.ogg",
+    "mp4": "video_output.mp4",
+}
+
 # Задачи держим в памяти процесса: file_id в callback_data не влезает (лимит 64 байта),
 # база данных для MVP не нужна. Ключ — id чата (= id пользователя в личке).
 PENDING: dict[int, dict] = {}
@@ -150,6 +162,15 @@ def human_size(num_bytes: int) -> str:
             return f"{size:.1f} {unit}"
         size /= 1024
     return f"{size:.1f} ТБ"
+
+
+def output_filename(fmt: str) -> str:
+    """Понятное имя выходного файла для формата: mp3 -> converted_audio.mp3 и т.д.
+
+    Для формата вне OUTPUT_NAMES подстраховываемся именем из converter (converted.<ext>).
+    """
+    named = OUTPUT_NAMES.get(fmt)
+    return named if named else f"converted.{output_ext(fmt)}"
 
 
 async def safe_edit(status: Message, text: str) -> None:
@@ -268,6 +289,33 @@ async def download_to_disk(client: Client, task: dict, input_path: Path, status:
     await fresh.download(file_name=str(input_path), progress=progress)
 
 
+async def send_result(task: dict, fmt: str, output_path: Path, file_name: str, progress) -> None:
+    """Отправляет готовый файл в чат с понятным именем.
+
+    Логика разделена по типам, потому что Telegram принимает file_name не везде:
+      * voice (OGG-голосовое) -> reply_voice БЕЗ file_name, иначе падает с
+        "TypeError: Message.reply_voice() got an unexpected keyword argument 'file_name'";
+      * mp4 -> reply_video (file_name поддерживается);
+      * mp3 / m4a / wav -> reply_audio (file_name и title поддерживаются).
+    """
+    message = task["message"]
+    if fmt == "voice":
+        await message.reply_voice(voice=str(output_path), progress=progress)
+    elif fmt == "mp4":
+        await message.reply_video(
+            video=str(output_path),
+            file_name=file_name,
+            progress=progress,
+        )
+    else:
+        await message.reply_audio(
+            audio=str(output_path),
+            title=Path(file_name).stem[:64],
+            file_name=file_name,
+            progress=progress,
+        )
+
+
 async def on_format(client: Client, callback: CallbackQuery) -> None:
     """Скачать -> сконвертировать -> отправить -> удалить временные файлы."""
     data = callback.data or ""
@@ -291,7 +339,7 @@ async def on_format(client: Client, callback: CallbackQuery) -> None:
     # Уникальные имена => задачи разных пользователей не пересекаются.
     input_path = DOWNLOAD_DIR / f"{uuid4().hex}_in"
     output_path = DOWNLOAD_DIR / f"{uuid4().hex}_out.{ext}"
-    result_name = f"{task['name']}.{ext}"
+    result_name = output_filename(fmt)  # понятное имя: converted_audio.mp3 и т.п.
 
     try:
         try:
@@ -316,18 +364,14 @@ async def on_format(client: Client, callback: CallbackQuery) -> None:
         await safe_edit(status, f"📤 Отправляю результат ({human_size(size_out)})...")
         upload_progress = make_progress(status, "📤 Отправляю")
         if fmt == "voice":
-            await chat_action(client, chat_id, enums.ChatAction.UPLOAD_AUDIO)
-            await task["message"].reply_voice(
-                voice=str(output_path), file_name=result_name, progress=upload_progress
-            )
+            action = enums.ChatAction.UPLOAD_AUDIO
+        elif fmt == "mp4":
+            action = enums.ChatAction.UPLOAD_VIDEO
         else:
-            await chat_action(client, chat_id, enums.ChatAction.UPLOAD_DOCUMENT)
-            await task["message"].reply_audio(
-                audio=str(output_path),
-                title=task["name"][:64],
-                file_name=result_name,
-                progress=upload_progress,
-            )
+            action = enums.ChatAction.UPLOAD_DOCUMENT
+        await chat_action(client, chat_id, action)
+        # Раздельная отправка: voice -> без file_name, audio/video -> с понятным file_name.
+        await send_result(task, fmt, output_path, result_name, upload_progress)
 
         try:
             await status.delete()
