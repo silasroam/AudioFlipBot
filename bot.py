@@ -44,6 +44,7 @@ from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMa
 
 from converter import ConvertError, convert_audio, ffmpeg_available, output_ext
 from database import get_and_increment_file_name, init_db
+from strings import LogMessages, UI
 
 # ============================== ДОСТУПЫ ==============================
 # В репозитории секретов нет вообще: значения читаются из окружения или из скрытых файлов
@@ -51,6 +52,30 @@ from database import get_and_increment_file_name, init_db
 BASE_DIR = Path(__file__).resolve().parent
 DOWNLOAD_DIR = BASE_DIR / "downloads"
 DOWNLOAD_DIR.mkdir(exist_ok=True)
+
+# ===== Логотип для команды /start =====
+# Картинка кладётся рядом с bot.py. Файл ищем без учёта регистра: Linux регистрозависим,
+# поэтому сработает и "Logostart.png", и "logostart.png". Нет файла — /start отдаст текст.
+LOGO_NAME = "Logostart.png"
+LOGO_ERR_MISSING = "⚠️ {name} не найден рядом с bot.py — /start покажет только текст"
+LOGO_ERR_SEND = "⚠️ Не удалось отправить логотип ({error}) — отправляю текстом"
+
+
+def find_logo() -> Path | None:
+    """Путь к логотипу рядом с bot.py (регистр имени не важен) или None."""
+    direct = BASE_DIR / LOGO_NAME
+    if direct.is_file():
+        return direct
+
+    target = LOGO_NAME.lower()
+    try:
+        for candidate in BASE_DIR.iterdir():
+            if candidate.is_file() and candidate.name.lower() == target:
+                return candidate
+    except OSError:
+        pass
+    return None
+
 
 HIDDEN_FILES = {"API_ID": ".api_id", "API_HASH": ".api_hash", "BOT_TOKEN": ".bot_token"}
 
@@ -89,10 +114,10 @@ HEALTH_HOST = "0.0.0.0"
 DEFAULT_PORT = 10000
 
 FORMATS = (
-    ("mp3", "🎵 MP3"),
-    ("voice", "🗣 OGG (голосовое)"),
-    ("wav", "🔊 WAV"),
-    ("m4a", "📱 M4A"),
+    ("mp3", UI.BUTTON_MP3),
+    ("voice", UI.BUTTON_OGG),
+    ("wav", UI.BUTTON_WAV),
+    ("m4a", UI.BUTTON_M4A),
 )
 FORMAT_CODES = {code for code, _ in FORMATS}
 
@@ -219,9 +244,14 @@ def make_progress(status: Message, label: str):
 
         await safe_edit(
             status,
-            f"{label} {percent:.1f}%\n"
-            f"{human_size(current)} из {human_size(total)} · {human_size(int(speed))}/с · "
-            f"осталось ~{left} с",
+            UI.progress(
+                label=label,
+                percent=int(percent),
+                current=human_size(current),
+                total=human_size(total),
+                speed=human_size(int(speed)),
+                left=left,
+            ),
         )
 
     return progress
@@ -241,11 +271,20 @@ async def chat_action(client: Client, chat_id: int, action) -> None:
 
 
 async def on_start(client: Client, message: Message) -> None:
-    await message.reply_text(
-        "👋 Пришли мне аудио, голосовое сообщение, видеосообщение, видео или файл — "
-        "предложу форматы: MP3, OGG (голосовое), WAV, M4A.\n"
-        "Работаю через MTProto, поэтому принимаю файлы до 2000 МБ."
-    )
+    """Приветствие: логотип Logostart.png с подписью. Нет картинки — просто текст."""
+    logo = find_logo()
+    if logo is not None:
+        try:
+            await message.reply_photo(
+                photo=str(logo),
+                caption=UI.START,
+                parse_mode=enums.ParseMode.MARKDOWN,
+            )
+            return
+        except RPCError as exc:
+            print(LOGO_ERR_SEND.format(error=f"{type(exc).__name__}: {exc}"))
+
+    await message.reply_text(UI.START, parse_mode=enums.ParseMode.MARKDOWN)
 
 
 MEDIA_FILTER = filters.incoming & (
@@ -262,15 +301,12 @@ async def on_media(client: Client, message: Message) -> None:
     """Приём медиа: кладём задачу в память и показываем кнопки форматов."""
     picked = pick_media(message)
     if picked is None:
-        await message.reply_text("❌ Это не аудио и не видео. Пришли звуковой или видеофайл.")
+        await message.reply_text(UI.NOT_MEDIA)
         return
 
     file_name, file_size, media_kind = picked
     if file_size and file_size > MAX_FILE_SIZE:
-        await message.reply_text(
-            f"❌ Файл {human_size(file_size)} больше предела MTProto "
-            f"({human_size(MAX_FILE_SIZE)}) — такой бот скачать не сможет."
-        )
+        await message.reply_text(UI.file_too_large(human_size(file_size)))
         return
 
     PENDING[message.chat.id] = {
@@ -280,9 +316,9 @@ async def on_media(client: Client, message: Message) -> None:
         "original_name": file_name,  # сырое имя (с расширением) — база для нумерации в БД
         "media_kind": media_kind,  # video/audio/voice/document — запасное базовое слово
     }
-    size_note = f" ({human_size(file_size)})" if file_size else ""
+    size_str = human_size(file_size) if file_size else "размер неизвестен"
     await message.reply_text(
-        f"📥 Файл получен{size_note}. Выбери целевой формат:",
+        UI.file_received(size_str),
         reply_markup=format_keyboard(),
     )
 
@@ -349,16 +385,16 @@ async def on_format(client: Client, callback: CallbackQuery) -> None:
     """Скачать -> сконвертировать -> отправить -> удалить временные файлы."""
     data = callback.data or ""
     if not data.startswith("fmt:"):
-        await callback.answer("Неизвестная кнопка")
+        await callback.answer(UI.UNKNOWN_BUTTON)
         return
 
     fmt = data.split(":", 1)[1]
     task = PENDING.pop(callback.from_user.id, None) if callback.from_user else None
     if task is None or fmt not in FORMAT_CODES:
-        await callback.answer("Кнопка устарела, пришли файл заново", show_alert=True)
+        await callback.answer(UI.BUTTON_EXPIRED, show_alert=True)
         return
     if callback.message is None:
-        await callback.answer("Сообщение недоступно, пришли файл заново", show_alert=True)
+        await callback.answer(UI.MESSAGE_UNAVAILABLE, show_alert=True)
         return
     await callback.answer()
 
@@ -378,7 +414,7 @@ async def on_format(client: Client, callback: CallbackQuery) -> None:
             callback.from_user.id, source_name, ext, fallback=media_kind
         )
     except Exception as exc:  # подстраховка: БД ни при каких условиях не роняет конвертацию
-        print(f"⚠️ Ошибка нумерации ({type(exc).__name__}: {exc}) — имя по умолчанию")
+        print(LogMessages.HANDLER_NUM_FAIL.format(error_type=type(exc).__name__, error=exc))
         result_name, result_title = output_filename(fmt), Path(output_filename(fmt)).stem
 
     try:
@@ -387,21 +423,16 @@ async def on_format(client: Client, callback: CallbackQuery) -> None:
         except RPCError:
             pass
 
-        await safe_edit(status, "⏳ Скачиваю файл из Telegram...")
+        await safe_edit(status, UI.DOWNLOADING)
         await chat_action(client, chat_id, enums.ChatAction.TYPING)
         await download_to_disk(client, task, input_path, status)
 
         size_in = input_path.stat().st_size if input_path.exists() else 0
-        await safe_edit(
-            status,
-            f"🔄 Конвертирую в {ext.upper()} через ffmpeg...\n"
-            f"Вход: {human_size(size_in)}. Большие файлы кодируются долго — не выключай бота.",
-        )
+        await safe_edit(status, UI.converting(ext, human_size(size_in)))
         await chat_action(client, chat_id, enums.ChatAction.TYPING)
         await convert_audio(input_path, output_path, fmt)
 
-        size_out = output_path.stat().st_size
-        await safe_edit(status, f"📤 Отправляю результат ({human_size(size_out)})...")
+        await safe_edit(status, UI.SENDING)
         upload_progress = make_progress(status, "📤 Отправляю")
         if fmt == "voice":
             action = enums.ChatAction.UPLOAD_AUDIO
@@ -419,16 +450,16 @@ async def on_format(client: Client, callback: CallbackQuery) -> None:
             pass
 
     except ConvertError as exc:
-        await safe_edit(status, f"❌ Не удалось сконвертировать: {str(exc)[:300]}")
-    except ValueError as exc:
+        await safe_edit(status, UI.ERR_CONVERT.format(details=str(exc)[:300]))
+    except ValueError:
         # например "Can't upload files bigger than 2000 MiB"
-        await safe_edit(status, f"❌ Файл слишком большой для отправки: {str(exc)[:200]}")
+        await safe_edit(status, UI.ERR_TOO_LARGE_TO_SEND)
     except FloodWait as exc:
-        await safe_edit(status, f"⏳ Telegram просит подождать {exc.value} с — нажми кнопку ещё раз.")
+        await safe_edit(status, UI.ERR_FLOOD.format(seconds=exc.value))
     except RPCError as exc:
-        await safe_edit(status, f"❌ Ошибка Telegram: {str(exc)[:200]}")
+        await safe_edit(status, UI.ERR_TELEGRAM_RPC.format(details=str(exc)[:200]))
     except Exception as exc:  # сеть, диск, лимиты — бот не должен падать
-        await safe_edit(status, f"❌ Ошибка: {str(exc)[:200]}")
+        await safe_edit(status, UI.ERR_GENERIC.format(details=str(exc)[:200]))
     finally:
         # КРИТИЧНО: временные файлы удаляем при любом исходе, чтобы не забить диск.
         for path in (input_path, output_path):
@@ -441,7 +472,7 @@ async def on_format(client: Client, callback: CallbackQuery) -> None:
 async def on_other(client: Client, message: Message) -> None:
     """Всё, что не медиа и не команда: короткая подсказка."""
     try:
-        await message.reply_text("Пришли аудио, голосовое сообщение, видео или файл 🙂")
+        await message.reply_text(UI.OTHER)
     except RPCError:
         pass
 
@@ -459,7 +490,7 @@ def health_port() -> int:
         port = int(raw)
     except ValueError:
         if raw:
-            print(f"⚠️ PORT={raw!r} — не число, использую {DEFAULT_PORT}")
+            print(LogMessages.INVALID_PORT.format(value=raw, default_port=DEFAULT_PORT))
         return DEFAULT_PORT
     return port if 0 < port < 65536 else DEFAULT_PORT
 
@@ -482,7 +513,7 @@ async def start_health_server() -> web.AppRunner:
     port = health_port()
     site = web.TCPSite(runner, host=HEALTH_HOST, port=port)
     await site.start()
-    print(f"🌐 Health-сервер слушает http://{HEALTH_HOST}:{port} (/, /health -> 200 OK)")
+    print(LogMessages.HEALTH_RUNNING.format(port=port))
     return runner
 
 
@@ -527,7 +558,7 @@ async def start_client(client: Client) -> Client:
         await client.start()
         return client
     except SESSION_ERRORS as exc:
-        print(f"⚠️ Сессия недействительна ({type(exc).__name__}) — удаляю её и логинюсь заново")
+        print(LogMessages.SESSION_EXPIRED.format(error_type=type(exc).__name__))
 
     try:
         await client.stop()
@@ -542,7 +573,7 @@ async def start_client(client: Client) -> Client:
 
     fresh = create_app()
     await fresh.start()
-    print("✅ Переавторизация по BOT_TOKEN прошла")
+    print(LogMessages.REAUTH_SUCCESS)
     return fresh
 
 
@@ -568,6 +599,9 @@ async def main() -> None:
     # появится автоматически. Ошибка БД не мешает запуску бота (см. database.py).
     await init_db()
 
+    if find_logo() is None:  # подсказка: без картинки /start отдаст только текст
+        print(LOGO_ERR_MISSING.format(name=LOGO_NAME))
+
     app = create_app()
     await asyncio.sleep(0.05)  # даём форку фактически зарегистрировать хендлеры
     registered = {
@@ -576,7 +610,7 @@ async def main() -> None:
     }
     if not registered:
         sys.exit("Хендлеры не зарегистрировались: Client создан вне работающего event loop")
-    print(f"🔧 Хендлеры: {registered}")
+    print(LogMessages.HANDLERS_LOADED.format(handlers=registered))
 
     # Render Web Service (Free) должен видеть открытый порт — поднимаем HTTP-заглушку
     # до старта Pyrogram-клиента. Падение веб-сервера не должно ронять бота.
@@ -584,13 +618,14 @@ async def main() -> None:
     try:
         health_runner = await start_health_server()
     except OSError as exc:  # порт занят или недоступен
-        print(f"⚠️ Health-сервер не поднялся ({exc}) — продолжаю без него")
+        print(LogMessages.HEALTH_FAIL.format(error=exc))
 
     app = await start_client(app)  # при мёртвой сессии вернёт переавторизованного клиента
     me = await app.get_me()
     print(
-        f"✅ Бот @{me.username} запущен через Pyrogram/MTProto. "
-        f"Лимит файла: {human_size(MAX_FILE_SIZE)}. Остановить: Ctrl+C"
+        LogMessages.BOT_STARTED.format(
+            username=me.username, limit=human_size(MAX_FILE_SIZE)
+        )
     )
     try:
         await idle()  # держим процесс живым и слушаем апдейты
@@ -598,7 +633,7 @@ async def main() -> None:
         await app.stop()
         if health_runner is not None:
             await health_runner.cleanup()  # освобождаем порт при остановке
-        print("⛔ Остановлено")
+        print(LogMessages.STOPPED_IDLE)
 
 
 if __name__ == "__main__":
@@ -607,4 +642,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n⛔ Остановлено (Ctrl+C)")
+        print(LogMessages.STOPPED_CTRL_C)

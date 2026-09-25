@@ -14,6 +14,8 @@ import asyncio
 import re
 from pathlib import Path
 
+from strings import LogMessages
+
 try:  # бот должен работать даже если aiosqlite вдруг не установлен
     import aiosqlite
 except ImportError:  # pragma: no cover - зависит от окружения
@@ -76,7 +78,7 @@ def clean_stem(original_filename: str | None, fallback: str = "audio") -> str:
 async def init_db(db_path: Path | str = DB_PATH) -> None:
     """Создаёт таблицу users_files, если её ещё нет. Ошибки только логируются."""
     if aiosqlite is None:
-        print("⚠️ aiosqlite не установлен — нумерация файлов работать не будет")
+        print(LogMessages.DB_NO_AIOSQLITE)
         return
 
     try:
@@ -90,12 +92,9 @@ async def init_db(db_path: Path | str = DB_PATH) -> None:
                 """
             )
             await db.commit()
-        print(f"🗄 База данных готова: {db_path}")
+        print(LogMessages.DB_READY.format(db_path=db_path))
     except Exception as exc:  # БД не должна мешать запуску бота
-        print(
-            f"⚠️ Не удалось инициализировать БД ({type(exc).__name__}: {exc}) — "
-            f"нумерация файлов будет без счётчика"
-        )
+        print(LogMessages.DB_INIT_FAIL.format(error_type=type(exc).__name__, error=exc))
 
 
 async def get_and_increment_file_name(
@@ -147,7 +146,7 @@ async def get_and_increment_file_name(
                     )
                 await db.commit()
     except Exception as exc:  # сеть/диск/блокировка — не роняем конвертацию
-        print(f"⚠️ БД недоступна ({type(exc).__name__}: {exc}) — имя без нумерации")
+        print(LogMessages.DB_NAME_FAIL.format(error_type=type(exc).__name__, error=exc))
         stem = clean_name
         return (f"{stem}.{ext}" if ext else stem), stem
 
