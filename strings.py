@@ -19,6 +19,7 @@ class UI:
         "• Конвертация в формат голосового сообщения (OGG)\n"
         "• Поддержка крупных файлов объемом до 2000 МБ\n"
         "• Автоматическая нумерация и сохранение названий"
+        "• Скачивание аудио по ссылке (YouTube, TikTok, VK, SoundCloud) — просто пришлите URL"
     )
 
     NOT_MEDIA = "❌ Формат не поддерживается. Пожалуйста, отправьте видео или аудиофайл."
@@ -53,6 +54,11 @@ class UI:
     def progress(label: str, percent: int, current: str, total: str, speed: str, left: int) -> str:
         return f"{label} {percent}%\nОбработано: {current} из {total} · Скорость: {speed}/с · Осталось: ~{left} с"
 
+    # --- Ссылки (yt-dlp: YouTube, TikTok, VK, SoundCloud и др.) ---
+    LINK_PROCESSING = "⏳ Извлекаю аудио по ссылке..."
+    ERR_LINK_FAILED = "❌ Не удалось скачать аудио по этой ссылке. Проверьте адрес или доступность медиа."
+    ERR_LINK_TOO_LARGE = "❌ Размер аудио по ссылке превышает допустимый лимит (2000 МБ)."
+
     # --- Уведомления и ошибки (Alerts) ---
     UNKNOWN_BUTTON = "Неизвестная команда."
     BUTTON_EXPIRED = "Запрос устарел. Пожалуйста, отправьте файл повторно."
@@ -73,6 +79,8 @@ class LogMessages:
     DB_INIT_FAIL = "⚠️ Ошибка инициализации БД ({error_type}: {error}) — обработка продолжится без счетчика"
     DB_NAME_FAIL = "⚠️ Ошибка БД при формировании имени ({error_type}: {error}) — применен базовый шаблон"
     HANDLER_NUM_FAIL = "⚠️ Сбой в логике нумерации ({error_type}: {error}) — используется имя по умолчанию"
+    LINK_FAIL = "⚠️ Ошибка загрузки по ссылке ({error})"
+    YTDLP_MISSING = "yt-dlp не установлен: добавь его в окружение (pip install yt-dlp)"
     SESSION_EXPIRED = "⚠️ Авторизационная сессия недействительна ({error_type}) — запуск повторной авторизации"
     REAUTH_SUCCESS = "✅ Повторная авторизация по BOT_TOKEN завершена успешно"
     HANDLERS_LOADED = "🔧 Зарегистрированы обработчики: {handlers}"

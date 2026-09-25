@@ -22,3 +22,10 @@ aiohttp>=3.9
 # Таблица users_files(user_id, file_count) создаётся автоматически при старте.
 # Асинхронный драйвер, чтобы работа с БД не блокировала event loop бота.
 aiosqlite>=0.19
+
+# --- Скачивание аудио по ссылкам (YouTube, TikTok, VK, SoundCloud и др.) ---
+# yt-dlp синхронный, поэтому его вызов оборачивается в asyncio.to_thread
+# (см. downloader.py) — event loop бота не блокируется. mp3-дорожку извлекает
+# системный ffmpeg (FFmpegExtractAudio), поэтому ffmpeg обязателен (см. README).
+# Регулярно обновляй пакет: экстракторы площадок быстро устаревают.
+yt-dlp>=2024.8.6

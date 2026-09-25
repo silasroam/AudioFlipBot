@@ -75,6 +75,32 @@ def clean_stem(original_filename: str | None, fallback: str = "audio") -> str:
     return name
 
 
+async def safe_get_file_suffix(
+    user_id: int,
+    title: str | None,
+    extension: str = "mp3",
+    fallback: str = "audio",
+) -> tuple[str, str]:
+    """Безопасная обёртка над get_and_increment_file_name: НИКОГДА не бросает исключение.
+
+    Нужна там, где имя строится не из файла, а из метаданных источника (например, title
+    из yt-dlp для ссылки). Название («Track») прогоняется через нумерацию пользователя:
+    Track.mp3 -> Track_1.mp3 -> Track_2.mp3 ... Если БД недоступна или название пустое/
+    авто-сгенерированное — вернётся базовое имя без суффикса (см. clean_stem).
+
+    Возвращает (имя файла с расширением, Title для плеера) — как get_and_increment_file_name.
+    """
+    try:
+        return await get_and_increment_file_name(
+            user_id, title, extension, fallback=fallback
+        )
+    except Exception as exc:  # подстраховка: БД ни при каких условиях не роняет задачу
+        print(LogMessages.DB_NAME_FAIL.format(error_type=type(exc).__name__, error=exc))
+        stem = clean_stem(title, fallback)
+        ext = (extension or "").lstrip(".")
+        return (f"{stem}.{ext}" if ext else stem), stem
+
+
 async def init_db(db_path: Path | str = DB_PATH) -> None:
     """Создаёт таблицу users_files, если её ещё нет. Ошибки только логируются."""
     if aiosqlite is None:

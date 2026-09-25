@@ -21,6 +21,8 @@ Render Web Service (Free): помимо бота поднимается крош
 import asyncio
 import logging
 import os
+import re
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -50,7 +52,8 @@ from pyrogram.types import (
 )
 
 from converter import ConvertError, convert_audio, ffmpeg_available, output_ext
-from database import get_and_increment_file_name, init_db
+from database import get_and_increment_file_name, init_db, safe_get_file_suffix
+from downloader import LinkError, LinkTooLargeError, download_audio_by_url
 from strings import LogMessages, UI
 
 # ============================== ДОСТУПЫ ==============================
@@ -335,6 +338,28 @@ MEDIA_FILTER = filters.incoming & (
 )
 
 
+# ===== Ссылки (yt-dlp: YouTube, TikTok, VK, SoundCloud и др.) =====
+# Своя регулярка + свой фильтр (как START_BUTTON_FILTER): filters.regex матчит и подписи
+# к медиа, а нам нужны только текстовые сообщения. Медиа без текста (message.text = None)
+# под URL_IN_TEXT_FILTER не попадёт, поэтому конфликта с MEDIA_FILTER нет.
+URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+
+URL_IN_TEXT_FILTER = filters.create(
+    lambda _, __, message: bool(URL_RE.search(message.text or "")),
+    name="UrlInText",
+)
+
+LINK_FILTER = filters.incoming & URL_IN_TEXT_FILTER
+
+
+def extract_url(text: str | None) -> str | None:
+    """Первая http(s)-ссылка из текста без хвостовой пунктуации или None."""
+    match = URL_RE.search(text or "")
+    if match is None:
+        return None
+    return match.group(0).rstrip(".,;:!?)]}\"'»…")
+
+
 async def on_media(client: Client, message: Message) -> None:
     """Приём медиа: кладём задачу в память и показываем кнопки форматов."""
     picked = pick_media(message)
@@ -509,6 +534,58 @@ async def on_format(client: Client, callback: CallbackQuery) -> None:
                 pass
 
 
+async def on_link(client: Client, message: Message) -> None:
+    """Скачивает аудио по ссылке (YouTube, TikTok, VK, SoundCloud...) и отдаёт mp3.
+
+    Загрузка идёт в отдельной папке задачи (downloads/<uuid>), поэтому одинаковые id
+    видео у разных пользователей не пересекаются. Готовый mp3 переименовывается в имя
+    из БД (Track.mp3 -> Track_1.mp3, как и для файлов), а папка удаляется в finally.
+    """
+    status = await message.reply_text(UI.LINK_PROCESSING)
+    url = extract_url(message.text) or (message.text or "").strip()
+    job_dir = DOWNLOAD_DIR / uuid4().hex
+    audio_path: Path | None = None
+
+    try:
+        job_dir.mkdir(parents=True, exist_ok=True)
+        # yt-dlp синхронный — download_audio_by_url уводит его в отдельный поток.
+        audio_path, title = await download_audio_by_url(url, job_dir)
+
+        user_id = message.from_user.id if message.from_user else message.chat.id
+        clean_title = (title or "").strip() or audio_path.stem
+        file_name, result_title = await safe_get_file_suffix(user_id, clean_title)
+
+        # Переименовываем временный файл в имя из БД: именно оно уходит в file_name/Title.
+        audio_path = audio_path.rename(job_dir / file_name)
+
+        await safe_edit(status, UI.SENDING)
+        await chat_action(client, message.chat.id, enums.ChatAction.UPLOAD_AUDIO)
+        upload_progress = make_progress(status, "📤 Отправляю")
+        await send_result(
+            {"message": message}, "mp3", audio_path, file_name, result_title, upload_progress
+        )
+        try:
+            await status.delete()
+        except RPCError:
+            pass
+
+    except LinkTooLargeError:
+        await safe_edit(status, UI.ERR_LINK_TOO_LARGE)
+    except LinkError as exc:
+        print(LogMessages.LINK_FAIL.format(error=str(exc)[:300]))
+        await safe_edit(status, UI.ERR_LINK_FAILED)
+    except FloodWait as exc:
+        await safe_edit(status, UI.ERR_FLOOD.format(seconds=exc.value))
+    except RPCError as exc:
+        await safe_edit(status, UI.ERR_TELEGRAM_RPC.format(details=str(exc)[:200]))
+    except Exception as exc:  # сеть, диск, ffmpeg — бот не должен падать
+        print(LogMessages.LINK_FAIL.format(error=f"{type(exc).__name__}: {exc}"))
+        await safe_edit(status, UI.ERR_LINK_FAILED)
+    finally:
+        # КРИТИЧНО: папку задачи удаляем при любом исходе, чтобы не забить диск.
+        shutil.rmtree(job_dir, ignore_errors=True)
+
+
 async def on_other(client: Client, message: Message) -> None:
     """Всё, что не медиа и не команда: короткая подсказка."""
     try:
@@ -560,6 +637,22 @@ async def start_health_server() -> web.AppRunner:
 # ============================== ЗАПУСК ==============================
 
 
+def message_handler_specs() -> list[tuple]:
+    """Пары (колбэк, фильтр) для MessageHandler в порядке регистрации.
+
+    Порядок критичен: первый подходящий хендлер в группе выигрывает. Поэтому ссылки
+    (on_link) идут ПОСЛЕ кнопки «▶️ Старт» и ДО общего текстового on_other. Функция
+    вынесена отдельно, чтобы порядок проверялся unit-тестами без запуска клиента.
+    """
+    return [
+        (on_start, filters.incoming & filters.command("start")),
+        (on_start_button, filters.incoming & START_BUTTON_FILTER),
+        (on_link, LINK_FILTER),  # ссылки — до общего текстового хендлера
+        (on_media, MEDIA_FILTER),
+        (on_other, filters.incoming),
+    ]
+
+
 def create_app() -> Client:
     """Создаёт клиента и регистрирует хендлеры. ВЫЗЫВАТЬ ТОЛЬКО внутри работающего event loop.
 
@@ -576,12 +669,8 @@ def create_app() -> Client:
         bot_token=BOT_TOKEN,
         workdir=str(BASE_DIR),
     )
-    client.add_handler(MessageHandler(on_start, filters.incoming & filters.command("start")))
-    client.add_handler(
-        MessageHandler(on_start_button, filters.incoming & START_BUTTON_FILTER)
-    )
-    client.add_handler(MessageHandler(on_media, MEDIA_FILTER))
-    client.add_handler(MessageHandler(on_other, filters.incoming))
+    for callback, message_filter in message_handler_specs():
+        client.add_handler(MessageHandler(callback, message_filter))
     client.add_handler(CallbackQueryHandler(on_format))
     return client
 
@@ -635,8 +724,13 @@ async def main() -> None:
         sys.exit("ffmpeg не найден. Установи: sudo apt install ffmpeg | brew install ffmpeg")
 
     for stale in DOWNLOAD_DIR.iterdir():  # подчищаем хвосты прошлых запусков
-        if stale.is_file():
-            stale.unlink(missing_ok=True)
+        try:
+            if stale.is_dir():
+                shutil.rmtree(stale, ignore_errors=True)  # папки задач из on_link
+            elif stale.is_file():
+                stale.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     # Создаём/открываем SQLite (bot_database.db) при старте: таблица users_files
     # появится автоматически. Ошибка БД не мешает запуску бота (см. database.py).
