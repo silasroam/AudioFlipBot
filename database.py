@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from pathlib import Path
 
 try:  # бот должен работать даже если aiosqlite вдруг не установлен
@@ -32,18 +33,44 @@ MEDIA_EXTS = {
 _DB_LOCK = asyncio.Lock()
 
 
-def clean_stem(original_filename: str | None) -> str:
-    """Базовое имя без расширения. Пусто или мусор -> 'audio'."""
+# Имена, которые клиент/Telegram подставляет сам: "video_2026-09-25_12-30-00.mp4",
+# "audio_2024-01-01_10-00-00.mp3", просто набор цифр или hex-мусор. Осмысленным именем
+# это не считаем — вместо него берём базовое слово по типу медиа (video/audio/document/voice).
+GENERIC_NAME_RE = re.compile(
+    r"^(?:video|audio|voice|video_note|animation|document|photo|sticker|gif)"
+    r"_\d{4}-\d{2}-\d{2}[_ ]\d{2}-\d{2}-\d{2}(?:[_ ]\d+)?$"  # <type>_2026-09-25_12-30-00
+    r"|^\d{6,}$"  # только цифры
+    r"|^[0-9a-f]{16,40}$",  # hex / uuid-подобный мусор
+    re.IGNORECASE,
+)
+
+# Управляющие символы и разделители пути: имя уходит в file_name (метаданные Telegram),
+# а не в файловую систему, поэтому достаточно не пускать в него мусор.
+UNSAFE_NAME_RE = re.compile(r"[\x00-\x1f\x7f/\\]+")
+
+
+def is_generic_name(name: str) -> bool:
+    """True для авто-сгенерированных имён (video_2026-09-25_12-30-00, набор цифр/hex)."""
+    return bool(GENERIC_NAME_RE.match((name or "").strip()))
+
+
+def clean_stem(original_filename: str | None, fallback: str = "audio") -> str:
+    """Базовое имя без расширения.
+
+    Пустое, небезопасное или авто-сгенерированное имя заменяется на `fallback` — базовое
+    слово по типу медиа: video / audio / document / voice.
+    """
+    fallback = (fallback or "").strip() or "audio"
     name = (original_filename or "").strip()
-    if not name:
-        return "audio"
+    if name:
+        suffix = Path(name).suffix.lower()
+        if suffix in MEDIA_EXTS:  # отрезаем только известные медиа-расширения
+            name = name[: -len(suffix)]
+        name = UNSAFE_NAME_RE.sub("_", name).strip().strip(".")
 
-    suffix = Path(name).suffix.lower()
-    if suffix in MEDIA_EXTS:  # отрезаем только известные медиа-расширения
-        name = name[: -len(suffix)]
-
-    name = name.strip().strip(".")
-    return name or "audio"
+    if not name or is_generic_name(name):
+        return fallback
+    return name
 
 
 async def init_db(db_path: Path | str = DB_PATH) -> None:
@@ -75,8 +102,13 @@ async def get_and_increment_file_name(
     user_id: int,
     original_filename: str | None,
     extension: str,
+    fallback: str = "audio",
 ) -> tuple[str, str]:
     """Возвращает (имя файла с суффиксом, красивый Title) и увеличивает счётчик.
+
+    Работает для любых типов: `original_filename` — исходное имя файла, `fallback` — базовое
+    слово по типу медиа (video/audio/document/voice) на случай, если имени нет или оно
+    авто-сгенерированное (см. clean_stem).
 
     Правила нумерации (file_count до инкремента):
         0 -> track.mp3
@@ -86,7 +118,7 @@ async def get_and_increment_file_name(
 
     При недоступной БД отдаём имя без суффикса (нумерация не соврёт, конвертация не упадёт).
     """
-    clean_name = clean_stem(original_filename)
+    clean_name = clean_stem(original_filename, fallback)
     ext = (extension or "").lstrip(".")
 
     if aiosqlite is None:

@@ -109,6 +109,22 @@ OUTPUT_NAMES = {
     "mp4": "video_output.mp4",
 }
 
+# Каким методом Telegram отдаём результат. Имя из БД подставляется везде, где это возможно:
+#   audio    -> reply_audio   (file_name + title)
+#   video    -> reply_video   (file_name)
+#   document -> reply_document(file_name)
+#   voice    -> reply_voice   (file_name НЕ поддерживается — имя задаёт Telegram)
+# Поэтому у голосового кнопка есть, а своего file_name нет: счётчик всё равно растёт.
+SEND_KINDS = {
+    "mp3": "audio",
+    "m4a": "audio",
+    "wav": "audio",
+    "voice": "voice",
+    "mp4": "video",
+}
+# Формат вне таблицы (например будущий «файл/документ») отдаём документом — тоже с именем из БД.
+DEFAULT_SEND_KIND = "document"
+
 # Задачи держим в памяти процесса: file_id в callback_data не влезает (лимит 64 байта), а сами
 # файлы в БД не храним — только счётчики (users_files). Ключ — id чата (= id пользователя в личке).
 PENDING: dict[int, dict] = {}
@@ -129,22 +145,28 @@ def format_keyboard() -> InlineKeyboardMarkup:
 
 
 def pick_media(message: Message):
-    """(имя_файла, размер_в_байтах) для поддерживаемого медиа или None."""
-    for attr, fallback_ext in (
-        ("audio", "mp3"),
-        ("voice", "oga"),
-        ("video_note", "mp4"),
-        ("video", "mp4"),
-        ("animation", "mp4"),
+    """(имя_файла, размер_в_байтах, тип_медиа) для поддерживаемого медиа или None.
+
+    Тип медиа задаёт базовое слово для имени результата, если у файла нет осмысленного имени
+    (video / audio / voice / document — см. database.clean_stem). Работает одинаково для
+    видео, аудио, документов и голосовых.
+    """
+    for attr, kind, fallback_ext in (
+        ("audio", "audio", "mp3"),
+        ("voice", "voice", "oga"),
+        ("video", "video", "mp4"),
+        ("video_note", "video", "mp4"),  # «кружок» — это тоже видео
+        ("animation", "video", "mp4"),  # GIF-анимация — тоже видео
     ):
         media = getattr(message, attr, None)
         if media is not None:
-            name = getattr(media, "file_name", None) or f"{attr}.{fallback_ext}"
-            return name, getattr(media, "file_size", 0) or 0
+            name = getattr(media, "file_name", None) or f"{kind}.{fallback_ext}"
+            return name, getattr(media, "file_size", 0) or 0, kind
 
     document = getattr(message, "document", None)
     if document is not None and (document.mime_type or "").startswith(("audio/", "video/")):
-        return document.file_name or "document.bin", document.file_size or 0
+        # Аудио/видео, присланное как файл: если имени нет — базовое слово "document".
+        return document.file_name or "document.bin", document.file_size or 0, "document"
     return None
 
 
@@ -243,7 +265,7 @@ async def on_media(client: Client, message: Message) -> None:
         await message.reply_text("❌ Это не аудио и не видео. Пришли звуковой или видеофайл.")
         return
 
-    file_name, file_size = picked
+    file_name, file_size, media_kind = picked
     if file_size and file_size > MAX_FILE_SIZE:
         await message.reply_text(
             f"❌ Файл {human_size(file_size)} больше предела MTProto "
@@ -256,6 +278,7 @@ async def on_media(client: Client, message: Message) -> None:
         "chat_id": message.chat.id,
         "message_id": message.id,
         "original_name": file_name,  # сырое имя (с расширением) — база для нумерации в БД
+        "media_kind": media_kind,  # video/audio/voice/document — запасное базовое слово
     }
     size_note = f" ({human_size(file_size)})" if file_size else ""
     await message.reply_text(
@@ -286,20 +309,30 @@ async def download_to_disk(client: Client, task: dict, input_path: Path, status:
 async def send_result(
     task: dict, fmt: str, output_path: Path, file_name: str, title: str, progress
 ) -> None:
-    """Отправляет готовый файл в чат с понятным именем.
+    """Отправляет готовый файл с именем из БД (file_name) и Title (для аудио).
 
-    Логика разделена по типам, потому что Telegram принимает file_name не везде:
+    Метод выбирается по формату (см. SEND_KINDS), потому что Telegram принимает file_name
+    не везде:
       * voice (OGG-голосовое) -> reply_voice БЕЗ file_name/title, иначе падает с
         "TypeError: Message.reply_voice() got an unexpected keyword argument 'file_name'";
-      * mp4 -> reply_video (file_name поддерживается);
-      * mp3 / m4a / wav -> reply_audio (file_name и title поддерживаются).
+      * mp4 -> reply_video с file_name;
+      * документы/прочие форматы -> reply_document с file_name;
+      * mp3 / m4a / wav -> reply_audio с file_name и title (Title виден в плеере).
     """
     message = task["message"]
-    if fmt == "voice":
+    kind = SEND_KINDS.get(fmt, DEFAULT_SEND_KIND)
+
+    if kind == "voice":
         await message.reply_voice(voice=str(output_path), progress=progress)
-    elif fmt == "mp4":
+    elif kind == "video":
         await message.reply_video(
             video=str(output_path),
+            file_name=file_name,
+            progress=progress,
+        )
+    elif kind == "document":
+        await message.reply_document(
+            document=str(output_path),
             file_name=file_name,
             progress=progress,
         )
@@ -335,12 +368,14 @@ async def on_format(client: Client, callback: CallbackQuery) -> None:
     # Уникальные имена => задачи разных пользователей не пересекаются.
     input_path = DOWNLOAD_DIR / f"{uuid4().hex}_in"
     output_path = DOWNLOAD_DIR / f"{uuid4().hex}_out.{ext}"
-    # Имя и Title по счётчику из БД: 1-й файл -> track.mp3, 2-й -> track_1.mp3, ...
-    # Берём исходное имя (или дружелюбный fallback по формату) и расширение выбранного формата.
-    source_name = task.get("original_name") or Path(output_filename(fmt)).name
+    # Имя и Title по счётчику из БД — работает для ВСЕХ типов (аудио, видео, документ,
+    # голосовое): 1-й файл -> video.mp3, 2-й -> video_1.mp3, 3-й -> video_2.mp3...
+    # База — исходное имя файла, а если его нет или оно авто-сгенерированное — слово по типу медиа.
+    media_kind = task.get("media_kind") or "audio"
+    source_name = task.get("original_name") or f"{media_kind}.{ext}"
     try:
         result_name, result_title = await get_and_increment_file_name(
-            callback.from_user.id, source_name, ext
+            callback.from_user.id, source_name, ext, fallback=media_kind
         )
     except Exception as exc:  # подстраховка: БД ни при каких условиях не роняет конвертацию
         print(f"⚠️ Ошибка нумерации ({type(exc).__name__}: {exc}) — имя по умолчанию")
